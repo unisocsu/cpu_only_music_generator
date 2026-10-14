@@ -1,6 +1,7 @@
 name: Generate song (CPU only)
 
-# Run from Actions -> Generate song (CPU only) -> Run workflow
+# Put this file at: .github/workflows/generate-song.yml
+# Run it from the Actions tab -> "Generate song (CPU only)" -> Run workflow
 
 on:
   workflow_dispatch:
@@ -9,20 +10,14 @@ on:
         description: "Style / mood description (English works best)"
         required: true
         default: "Upbeat acoustic folk with warm guitar and gentle drums"
-        type: string
       lyrics:
         description: "Lyrics, or [Instrumental] for no vocals, or leave empty to let the model write them"
         required: false
         default: "[Instrumental]"
-        type: string
       duration:
         description: "Duration in seconds (0 = model decides). Start short, e.g. 30"
         required: true
         default: "30"
-        type: string
-
-permissions:
-  contents: read
 
 jobs:
   generate:
@@ -33,23 +28,41 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libopenblas-dev jq python3-pip
+          sudo apt-get install -y cmake build-essential libopenblas-dev jq
 
       - name: Clone acestep.cpp (with ggml submodule)
         run: |
-          git clone --recurse-submodules --depth 1 https://github.com/ServeurpersoCom/acestep.cpp.git
+          git clone --recurse-submodules --depth 1 \
+            https://github.com/ServeurpersoCom/acestep.cpp.git
+
+      - name: Patch - allow ACESTEP_THREADS to set the CPU thread count
+        working-directory: acestep.cpp
+        run: |
+          python3 - <<'EOF'
+          p = 'src/backend.h'
+          s = open(p).read()
+          old = "static int backend_cpu_n_threads(void) {\n"
+          new = old + (
+              "    const char * env = getenv(\"ACESTEP_THREADS\");\n"
+              "    if (env && atoi(env) > 0) {\n"
+              "        return atoi(env);\n"
+              "    }\n"
+          )
+          assert old in s
+          open(p, 'w').write(s.replace(old, new, 1))
+          EOF
+          git diff --stat
 
       - name: Build (CPU only, BLAS)
         working-directory: acestep.cpp
         run: |
-          chmod +x buildcpu.sh
           ./buildcpu.sh
-          ls -lah build
+          ls build
 
       - name: Download models (Q8_0 turbo set, ~7.7 GB)
         working-directory: acestep.cpp
         run: |
-          python3 -m pip install --user hf
+          pip install hf
           ./models.sh
           ls -lh models
           df -h .
@@ -65,30 +78,31 @@ jobs:
             --arg caption "$CAPTION" \
             --arg lyrics "$LYRICS" \
             --argjson duration "$DURATION" \
-            '{caption: $caption, lyrics: $lyrics, duration: $duration, output_format: "mp3"}' > out/request.json
+            '{caption: $caption, lyrics: $lyrics, duration: $duration,
+              output_format: "mp3"}' > out/request.json
           cat out/request.json
 
       - name: Stage 1 - language model (lyrics + audio codes)
         working-directory: acestep.cpp
+        env:
+          ACESTEP_THREADS: "4"
         run: |
           time ./build/ace-lm \
             --models models \
             --request ../out/request.json
-          test -f ../out/request0.json || (echo "Expected out/request0.json was not created by ace-lm"; find ../out -maxdepth 2 -type f -ls; exit 1)
 
       - name: Stage 2 - diffusion + VAE (render audio)
         working-directory: acestep.cpp
+        env:
+          ACESTEP_THREADS: "4"
         run: |
           time ./build/ace-synth \
             --models models \
             --request ../out/request0.json
           ls -lh ../out
-          find ../out -maxdepth 2 -type f -ls
 
       - name: Upload result
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: song
           path: out/
-          if-no-files-found: warn
